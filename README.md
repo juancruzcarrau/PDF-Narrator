@@ -57,3 +57,7 @@ Keep the app in your Applications folder so it can update itself.
 
 - PDF Narrator needs a PDF with real, selectable text. Scanned pages (photos of paper) can't be read.
 - Everything happens on your Mac. Your PDFs are never uploaded anywhere.
+
+## License
+
+PDF Narrator is free and open source, under the [MIT License](LICENSE).
