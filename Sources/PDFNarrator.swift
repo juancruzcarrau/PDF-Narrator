@@ -34,6 +34,8 @@ struct TextLine {
     let isBold: Bool
     let family: String
     let color: RGB
+    /// Sits on a picture, chart or table drawn on the page.
+    var inFigure = false
 }
 
 enum BlockKind { case body, heading }
@@ -87,9 +89,21 @@ struct SkippedLine {
 enum Extractor {
     static func lines(of page: PDFPage, index: Int) -> [TextLine] {
         guard let selection = page.selection(for: page.bounds(for: .mediaBox)) else { return [] }
-        return selection.selectionsByLine().compactMap { line in
+        var lines = selection.selectionsByLine().compactMap { line -> TextLine? in
             guard let attributed = line.attributedString else { return nil }
             return clean(attributed, pageIndex: index, bounds: line.bounds(for: page))
+        }
+        markFigureText(&lines, regions: Figures.regions(of: page))
+        return lines
+    }
+
+    /// Marks lines inside a figure region, unless the region's text reads like prose
+    /// (e.g. a paragraph over a photo, or highlighted lines): chart and table labels are short.
+    private static func markFigureText(_ lines: inout [TextLine], regions: [CGRect]) {
+        for region in regions {
+            let inside = lines.indices.filter { region.contains(CGPoint(x: lines[$0].bounds.midX, y: lines[$0].bounds.midY)) }
+            guard let width = median(inside.map { lines[$0].bounds.width }), width < region.width * 0.6 else { continue }
+            for i in inside { lines[i].inFigure = true }
         }
     }
 
@@ -285,6 +299,7 @@ enum Extractor {
                     : isBoilerplate(line.text) ? "copyright/boilerplate"
                     : inBackMatter ? "endnotes/references"
                     : inExhibit ? "exhibit/figure"
+                    : options.mainTextOnly && line.inFigure ? "chart/picture"
                     : marginReason(line)
                 if let reason {
                     skipped.append(SkippedLine(pageIndex: line.pageIndex, text: line.text, reason: reason))
@@ -421,6 +436,188 @@ enum Extractor {
         }
         flush()
         return result
+    }
+}
+
+// MARK: - Figures
+
+/// Finds where a page draws pictures and charts, by walking its content stream:
+/// images are placed with `Do`, charts and tables are clusters of painted paths.
+enum Figures {
+    private final class State {
+        var ctm = CGAffineTransform.identity
+        var stack: [CGAffineTransform] = []
+        var path = CGRect.null
+        var paths: [CGRect] = []
+        var images: [CGRect] = []
+        var depth = 0
+        let table: CGPDFOperatorTableRef
+
+        init(table: CGPDFOperatorTableRef) { self.table = table }
+
+        func addPoint(_ x: CGFloat, _ y: CGFloat) {
+            let p = CGPoint(x: x, y: y).applying(ctm)
+            path = path.union(CGRect(origin: p, size: .zero))
+        }
+    }
+
+    private static func state(_ info: UnsafeMutableRawPointer?) -> State {
+        Unmanaged<State>.fromOpaque(info!).takeUnretainedValue()
+    }
+
+    /// Pops `count` numbers, returned in the order they appear in the stream.
+    private static func numbers(_ scanner: CGPDFScannerRef, _ count: Int) -> [CGFloat] {
+        var result: [CGFloat] = []
+        for _ in 0..<count {
+            var n: CGPDFReal = 0
+            guard CGPDFScannerPopNumber(scanner, &n) else { return [] }
+            result.append(n)
+        }
+        return result.reversed()
+    }
+
+    private static func paint(_ scanner: CGPDFScannerRef, _ info: UnsafeMutableRawPointer?) {
+        let s = state(info)
+        if !s.path.isNull { s.paths.append(s.path) }
+        s.path = .null
+    }
+
+    private static let table: CGPDFOperatorTableRef = {
+        let t = CGPDFOperatorTableCreate()!
+        CGPDFOperatorTableSetCallback(t, "q") { _, info in
+            let s = state(info); s.stack.append(s.ctm)
+        }
+        CGPDFOperatorTableSetCallback(t, "Q") { _, info in
+            let s = state(info); if let m = s.stack.popLast() { s.ctm = m }
+        }
+        CGPDFOperatorTableSetCallback(t, "cm") { scanner, info in
+            let n = numbers(scanner, 6)
+            guard n.count == 6 else { return }
+            let s = state(info)
+            s.ctm = CGAffineTransform(a: n[0], b: n[1], c: n[2], d: n[3], tx: n[4], ty: n[5]).concatenating(s.ctm)
+        }
+        for op in ["m", "l"] {
+            CGPDFOperatorTableSetCallback(t, op) { scanner, info in
+                let n = numbers(scanner, 2)
+                if n.count == 2 { state(info).addPoint(n[0], n[1]) }
+            }
+        }
+        CGPDFOperatorTableSetCallback(t, "c") { scanner, info in
+            let n = numbers(scanner, 6)
+            for i in stride(from: 0, to: n.count, by: 2) { state(info).addPoint(n[i], n[i + 1]) }
+        }
+        for op in ["v", "y"] {
+            CGPDFOperatorTableSetCallback(t, op) { scanner, info in
+                let n = numbers(scanner, 4)
+                for i in stride(from: 0, to: n.count, by: 2) { state(info).addPoint(n[i], n[i + 1]) }
+            }
+        }
+        CGPDFOperatorTableSetCallback(t, "re") { scanner, info in
+            let n = numbers(scanner, 4)
+            guard n.count == 4 else { return }
+            let s = state(info)
+            s.addPoint(n[0], n[1])
+            s.addPoint(n[0] + n[2], n[1] + n[3])
+        }
+        for op in ["f", "F", "f*", "S", "s", "B", "B*", "b", "b*"] {
+            CGPDFOperatorTableSetCallback(t, op) { scanner, info in paint(scanner, info) }
+        }
+        CGPDFOperatorTableSetCallback(t, "n") { _, info in state(info).path = .null }
+        CGPDFOperatorTableSetCallback(t, "EI") { _, info in
+            let s = state(info)
+            s.images.append(CGRect(x: 0, y: 0, width: 1, height: 1).applying(s.ctm))
+        }
+        CGPDFOperatorTableSetCallback(t, "Do") { scanner, info in
+            var name: UnsafePointer<CChar>?
+            guard CGPDFScannerPopName(scanner, &name), let name else { return }
+            let content = CGPDFScannerGetContentStream(scanner)
+            var stream: CGPDFStreamRef?
+            guard let object = CGPDFContentStreamGetResource(content, "XObject", name),
+                  CGPDFObjectGetValue(object, .stream, &stream), let stream,
+                  let dict = CGPDFStreamGetDictionary(stream) else { return }
+            var subtype: UnsafePointer<CChar>?
+            guard CGPDFDictionaryGetName(dict, "Subtype", &subtype), let subtype else { return }
+            let s = state(info)
+            switch String(cString: subtype) {
+            case "Image":
+                s.images.append(CGRect(x: 0, y: 0, width: 1, height: 1).applying(s.ctm))
+            case "Form" where s.depth < 6:
+                // Charts are often drawn inside form XObjects: scan them in place.
+                let saved = s.ctm
+                var matrix: CGPDFArrayRef?
+                if CGPDFDictionaryGetArray(dict, "Matrix", &matrix), let matrix, CGPDFArrayGetCount(matrix) == 6 {
+                    var m = [CGPDFReal](repeating: 0, count: 6)
+                    for i in 0..<6 { _ = CGPDFArrayGetNumber(matrix, i, &m[i]) }
+                    s.ctm = CGAffineTransform(a: m[0], b: m[1], c: m[2], d: m[3], tx: m[4], ty: m[5]).concatenating(s.ctm)
+                }
+                var resources: CGPDFDictionaryRef?
+                _ = CGPDFDictionaryGetDictionary(dict, "Resources", &resources)
+                let formContent = CGPDFContentStreamCreateWithStream(stream, resources ?? dict, content)
+                let formScanner = CGPDFScannerCreate(formContent, s.table, info)
+                s.depth += 1
+                CGPDFScannerScan(formScanner)
+                s.depth -= 1
+                s.ctm = saved
+            default:
+                break
+            }
+        }
+        return t
+    }()
+
+    /// Areas of the page (in page coordinates) covered by pictures, charts or tables.
+    static func regions(of page: PDFPage) -> [CGRect] {
+        guard let cgPage = page.pageRef else { return [] }
+        let pageRect = page.bounds(for: .mediaBox)
+        let pageArea = pageRect.width * pageRect.height
+        guard pageArea > 0 else { return [] }
+
+        let s = State(table: table)
+        let info = Unmanaged.passUnretained(s).toOpaque()
+        let content = CGPDFContentStreamCreateWithPage(cgPage)
+        let scanner = CGPDFScannerCreate(content, table, info)
+        CGPDFScannerScan(scanner)
+
+        func area(_ r: CGRect) -> CGFloat { r.width * r.height }
+        // Pictures are tested one by one, so text placed between them (e.g. a slide's own callouts) is kept.
+        // Page backgrounds and slide-wide panels aren't figures.
+        let images = s.images.filter { area($0) >= pageArea * 0.015 && area($0) < pageArea * 0.5 }
+        let paths = s.paths.filter { area($0) < pageArea * 0.5 }
+        let charts = clusters(paths.map { $0.insetBy(dx: -3, dy: -3) }).filter { g in
+            let a = area(g.rect)
+            return g.count >= 10 && a >= pageArea * 0.03 && a < pageArea * 0.6 && g.rect.width > 40 && g.rect.height > 40
+        }
+        return images + charts.map(\.rect)
+    }
+
+    /// Groups overlapping rectangles (a chart's bars, gridlines and axes end up in one group).
+    /// Union-find over a coarse grid, so pages with thousands of shapes stay fast.
+    private static func clusters(_ rects: [CGRect]) -> [(rect: CGRect, count: Int)] {
+        var parent = Array(rects.indices)
+        func root(_ i: Int) -> Int {
+            var i = i
+            while parent[i] != i { parent[i] = parent[parent[i]]; i = parent[i] }
+            return i
+        }
+        let cell: CGFloat = 40
+        var grid: [Int: [Int]] = [:]
+        for (i, r) in rects.enumerated() {
+            for gx in Int((r.minX / cell).rounded(.down))...Int((r.maxX / cell).rounded(.down)) {
+                for gy in Int((r.minY / cell).rounded(.down))...Int((r.maxY / cell).rounded(.down)) {
+                    let key = gx &* 100_003 &+ gy
+                    for j in grid[key, default: []] where root(i) != root(j) && rects[j].intersects(r) {
+                        parent[root(i)] = root(j)
+                    }
+                    grid[key, default: []].append(i)
+                }
+            }
+        }
+        var groups: [Int: (rect: CGRect, count: Int)] = [:]
+        for (i, r) in rects.enumerated() {
+            let g = groups[root(i), default: (CGRect.null, 0)]
+            groups[root(i)] = (g.rect.union(r), g.count + 1)
+        }
+        return Array(groups.values)
     }
 }
 
@@ -1496,9 +1693,14 @@ enum Main {
         }
         if let i = CommandLine.arguments.firstIndex(of: "--lines"), i + 1 < CommandLine.arguments.count,
            let page = Int(CommandLine.arguments[i + 1]), lines.indices.contains(page - 1) {
+            if let pdfPage = doc.page(at: page - 1) {
+                for r in Figures.regions(of: pdfPage) {
+                    print(String(format: "figure x=%.0f y=%.0f w=%.0f h=%.0f", r.minX, r.minY, r.width, r.height))
+                }
+            }
             for l in lines[page - 1] {
-                print(String(format: "%5.1f y=%4.0f x=%4.0f %@%@ c=%d,%d,%d | %@", l.fontSize, l.bounds.minY, l.bounds.minX,
-                             l.family, l.isBold ? " B" : "", l.color.r, l.color.g, l.color.b, l.text))
+                print(String(format: "%5.1f y=%4.0f x=%4.0f %@%@%@ c=%d,%d,%d | %@", l.fontSize, l.bounds.minY, l.bounds.minX,
+                             l.family, l.isBold ? " B" : "", l.inFigure ? " FIG" : "", l.color.r, l.color.g, l.color.b, l.text))
             }
             return
         }

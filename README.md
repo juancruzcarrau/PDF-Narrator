@@ -6,7 +6,7 @@ meant to sit next to Preview while you read.
 - Shows the extracted text; click any word to start reading from there. The spoken word is highlighted.
 - Chapter sidebar from the PDF's own bookmarks: click a chapter to start reading there.
 - "Main text only" skips headers/footers, page numbers, headings, pull quotes, decks/bylines, captions,
-  exhibit pages, footnotes, endnotes and copyright boilerplate.
+  text on charts, diagrams and pictures, exhibit pages, footnotes, endnotes and copyright boilerplate.
 - Joins the lines of a paragraph before speaking, so the voice keeps its intonation across line breaks.
 - Repairs line-break hyphens and missing "fi/ffi" ligatures using the system spell checker.
 
