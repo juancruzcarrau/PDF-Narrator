@@ -784,12 +784,16 @@ final class Reader: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, NSS
         }
     }
     @Published var rate: Float = UserDefaults.standard.object(forKey: "rate") as? Float ?? 0.5 {
-        didSet { UserDefaults.standard.set(rate, forKey: "rate") }
+        didSet {
+            UserDefaults.standard.set(rate, forKey: "rate")
+            resetSpeed()
+        }
     }
     /// "system" (the voice chosen in System Settings, e.g. a Siri voice), "auto", or a voice identifier.
     @Published var voiceID: String = UserDefaults.standard.string(forKey: "voiceID") ?? "system" {
         didSet {
             UserDefaults.standard.set(voiceID, forKey: "voiceID")
+            resetSpeed()
             applySettingsChange()
         }
     }
@@ -807,6 +811,13 @@ final class Reader: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, NSS
     private var pageRects: [CGRect] = []
     private var outline: [OutlineEntry] = []
     private var loadID = UUID()
+    /// wordsFrom[i]: words in paragraph i and everything after it.
+    private var wordsFrom = [0]
+    /// Speaking speed measured while reading (words per second); nil until enough words were timed.
+    @Published private var measuredSpeed: Double?
+    private var lastWordTime: Date?
+    private var timedWords = 0
+    private var timedSeconds: TimeInterval = 0
 
     override init() {
         options = ReadingOptions(mainTextOnly: UserDefaults.standard.object(forKey: "mainTextOnly") as? Bool ?? true)
@@ -883,6 +894,8 @@ final class Reader: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, NSS
         var skipped: [SkippedLine] = []
         paragraphs = Extractor.paragraphs(pages: pageLines, rects: pageRects, options: options, skipped: &skipped)
         chapters = Outline.chapters(outline, in: paragraphs)
+        wordsFrom = [0]
+        for p in paragraphs.reversed() { wordsFrom.insert(wordsFrom[0] + Self.wordCount(p.text), at: 0) }
         currentIndex = nil
         currentPage = nil
         generation += 1
@@ -901,6 +914,7 @@ final class Reader: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, NSS
         } else if isPlaying {
             if let s = systemSynth { s.pauseSpeaking(at: .wordBoundary) } else { synth.pauseSpeaking(at: .word) }
             isPaused = true
+            lastWordTime = nil
         } else if let i = currentIndex {
             speak(i, from: spokenLocation)
         } else if !paragraphs.isEmpty {
@@ -968,6 +982,46 @@ final class Reader: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, NSS
         cancelUtterance()
         isPlaying = false
         isPaused = false
+        lastWordTime = nil
+    }
+
+    // MARK: Time estimate
+
+    private static func wordCount(_ text: String) -> Int {
+        text.split(whereSeparator: \.isWhitespace).count
+    }
+
+    /// Words not yet spoken (the whole text when nothing is being read).
+    var remainingWords: Int {
+        guard let i = currentIndex, paragraphs.indices.contains(i) else { return wordsFrom[0] }
+        let text = paragraphs[i].text as NSString
+        let location = min(wordRange?.location ?? 0, text.length)
+        return Self.wordCount(text.substring(from: location)) + wordsFrom[i + 1]
+    }
+
+    /// Measured speed once known; until then a guess of ~165 words/minute at the default speed.
+    var wordsPerSecond: Double {
+        measuredSpeed ?? 165.0 / 60 * Double(1 + (rate - 0.5) * 2.5)
+    }
+
+    var secondsLeft: Double { Double(remainingWords) / wordsPerSecond }
+
+    private func resetSpeed() {
+        measuredSpeed = nil
+        lastWordTime = nil
+        timedWords = 0
+        timedSeconds = 0
+    }
+
+    /// Times the gaps between spoken words (pauses between paragraphs included) to learn the real speed.
+    private func timeWord() {
+        let now = Date()
+        if let last = lastWordTime, now.timeIntervalSince(last) < 3 {
+            timedWords += 1
+            timedSeconds += now.timeIntervalSince(last)
+            if timedWords >= 20, timedWords % 5 == 0 { measuredSpeed = Double(timedWords) / timedSeconds }
+        }
+        lastWordTime = now
     }
 
     private func finish() {
@@ -1043,6 +1097,7 @@ final class Reader: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, NSS
         spokenLocation = utteranceOffset + range.location
         wordRange = NSRange(location: spokenLocation, length: range.length)
         updatePage()
+        timeWord()
     }
 
     func speechSynthesizer(_ sender: NSSpeechSynthesizer, willSpeakWord range: NSRange, of string: String) {
@@ -1511,6 +1566,14 @@ struct ContentView: View {
                 ProgressView(value: reader.progress)
                     .progressViewStyle(.linear)
                     .controlSize(.small)
+                if let timeLabel {
+                    Text(timeLabel)
+                        .font(.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .fixedSize()
+                        .help("Estimated reading time at the current voice and speed")
+                }
             }
         }
     }
@@ -1569,6 +1632,14 @@ struct ContentView: View {
         .padding(.vertical, 6)
         .background(Color.accentColor.opacity(0.08))
         .help(release.notes)
+    }
+
+    private var timeLabel: String? {
+        guard !reader.paragraphs.isEmpty else { return nil }
+        let minutes = Int((reader.secondsLeft / 60).rounded(.up))
+        guard minutes > 0 else { return nil }
+        let text = minutes >= 60 ? "\(minutes / 60) h \(minutes % 60) min" : "\(minutes) min"
+        return reader.currentIndex == nil ? "about \(text)" : "\(text) left"
     }
 
     private var pageLabel: String {

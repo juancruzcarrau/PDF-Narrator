@@ -4,6 +4,7 @@ A small floating macOS player that reads the main text of a PDF aloud with macOS
 meant to sit next to Preview while you read.
 
 - Shows the extracted text; click any word to start reading from there. The spoken word is highlighted.
+- Shows the estimated reading time, then the time left; it learns the voice's real speed as it reads.
 - Chapter sidebar from the PDF's own bookmarks: click a chapter to start reading there.
 - "Main text only" skips headers/footers, page numbers, headings, pull quotes, decks/bylines, captions,
   text on charts, diagrams and pictures, exhibit pages, footnotes, endnotes and copyright boilerplate.
