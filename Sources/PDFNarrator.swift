@@ -42,6 +42,8 @@ enum BlockKind { case body, heading }
 struct Segment {
     let range: NSRange
     let pageIndex: Int
+    /// Top edge of the line, in page coordinates (y grows upward).
+    let top: CGFloat
 }
 
 struct Paragraph: Identifiable {
@@ -55,6 +57,23 @@ struct Paragraph: Identifiable {
 struct ReadingOptions: Equatable {
     /// Skip headings, sub-headlines, pull quotes, captions, sidebars and footnotes.
     var mainTextOnly = true
+}
+
+/// A bookmark from the PDF's own outline (table of contents).
+struct OutlineEntry {
+    let title: String
+    let level: Int
+    let pageIndex: Int
+    /// Where on the page the bookmark points, if it says.
+    let y: CGFloat?
+}
+
+struct Chapter: Identifiable {
+    let id: Int
+    let title: String
+    let level: Int
+    /// First paragraph read aloud at or after the bookmark; nil if none is (e.g. a skipped appendix).
+    let paragraph: Int?
 }
 
 struct SkippedLine {
@@ -397,11 +416,45 @@ enum Extractor {
             let start = (text as NSString).length
             text += line.text
             segments.append(Segment(range: NSRange(location: start, length: (line.text as NSString).length),
-                                    pageIndex: line.pageIndex))
+                                    pageIndex: line.pageIndex, top: line.bounds.maxY))
             prev = line
         }
         flush()
         return result
+    }
+}
+
+// MARK: - Outline
+
+enum Outline {
+    static func entries(of doc: PDFDocument) -> [OutlineEntry] {
+        var result: [OutlineEntry] = []
+        func walk(_ node: PDFOutline, level: Int) {
+            for i in 0..<node.numberOfChildren {
+                guard let child = node.child(at: i) else { continue }
+                let title = child.label?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if !title.isEmpty, let dest = child.destination ?? (child.action as? PDFActionGoTo)?.destination,
+                   let page = dest.page {
+                    let y = dest.point.y
+                    result.append(OutlineEntry(title: title, level: level, pageIndex: doc.index(for: page),
+                                               y: y == kPDFDestinationUnspecifiedValue ? nil : y))
+                }
+                walk(child, level: level + 1)
+            }
+        }
+        if let root = doc.outlineRoot { walk(root, level: 0) }
+        return result
+    }
+
+    /// Maps bookmarks to the paragraphs they point at.
+    static func chapters(_ entries: [OutlineEntry], in paragraphs: [Paragraph]) -> [Chapter] {
+        entries.enumerated().map { i, e in
+            let paragraph = paragraphs.firstIndex { p in
+                guard let s = p.segments.first else { return false }
+                return s.pageIndex > e.pageIndex || (s.pageIndex == e.pageIndex && e.y.map { s.top <= $0 + 2 } ?? true)
+            }
+            return Chapter(id: i, title: e.title, level: e.level, paragraph: paragraph)
+        }
     }
 }
 
@@ -513,6 +566,7 @@ final class Reader: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, NSS
     @Published private(set) var fileName = ""
     @Published private(set) var pageCount = 0
     @Published private(set) var paragraphs: [Paragraph] = []
+    @Published private(set) var chapters: [Chapter] = []
     /// Bumped whenever `paragraphs` is rebuilt, so the text view knows to re-render.
     @Published private(set) var generation = 0
     @Published private(set) var currentIndex: Int?
@@ -554,6 +608,7 @@ final class Reader: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, NSS
     private var spokenLocation = 0
     private var pageLines: [[TextLine]] = []
     private var pageRects: [CGRect] = []
+    private var outline: [OutlineEntry] = []
     private var loadID = UUID()
 
     override init() {
@@ -582,6 +637,8 @@ final class Reader: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, NSS
         stop()
         fileName = url.lastPathComponent
         paragraphs = []
+        chapters = []
+        outline = []
         pageLines = []
         pageCount = 0
         currentIndex = nil
@@ -609,10 +666,12 @@ final class Reader: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, NSS
                 lines.append(Extractor.lines(of: page, index: i))
                 if i % 5 == 0 { report("Analyzing page \(i + 1) of \(doc.pageCount)…") }
             }
+            let outline = Outline.entries(of: doc)
             DispatchQueue.main.async {
                 guard self.loadID == id else { return }
                 self.pageLines = lines
                 self.pageRects = rects
+                self.outline = outline
                 self.pageCount = lines.count
                 self.rebuild()
                 self.updateNowPlaying()
@@ -626,6 +685,7 @@ final class Reader: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, NSS
         stop()
         var skipped: [SkippedLine] = []
         paragraphs = Extractor.paragraphs(pages: pageLines, rects: pageRects, options: options, skipped: &skipped)
+        chapters = Outline.chapters(outline, in: paragraphs)
         currentIndex = nil
         currentPage = nil
         generation += 1
@@ -1166,6 +1226,7 @@ struct ContentView: View {
     @ObservedObject var reader = Reader.shared
     @ObservedObject var updater = Updater.shared
     @AppStorage("alwaysOnTop") private var onTop = true
+    @AppStorage("showChapters") private var showChapters = true
     @State private var dropTargeted = false
 
     private var playing: Bool { reader.isPlaying && !reader.isPaused }
@@ -1188,11 +1249,17 @@ struct ContentView: View {
                     .padding()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(dropTargeted ? Color.accentColor.opacity(0.1) : .clear)
+            } else if sidebarVisible {
+                HStack(spacing: 0) {
+                    chapterList
+                    Divider()
+                    ReaderTextView()
+                }
             } else {
                 ReaderTextView()
             }
         }
-        .frame(minWidth: 300, minHeight: 140)
+        .frame(minWidth: sidebarVisible ? 480 : 300, minHeight: 140)
         .background(WindowLevel(floating: onTop))
         .navigationTitle(reader.fileName.isEmpty ? "PDF Narrator" : reader.fileName)
         .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
@@ -1230,6 +1297,9 @@ struct ContentView: View {
                 .frame(maxWidth: 90)
                 .help("Speaking speed")
                 Image(systemName: "hare").foregroundStyle(.secondary).font(.caption)
+                Button { showChapters.toggle() } label: { Image(systemName: "sidebar.left") }
+                    .disabled(reader.chapters.isEmpty)
+                    .help(reader.chapters.isEmpty ? "This PDF has no chapter list" : "Show / hide chapters")
                 moreMenu
             }
             .buttonStyle(.borderless)
@@ -1244,6 +1314,43 @@ struct ContentView: View {
                 ProgressView(value: reader.progress)
                     .progressViewStyle(.linear)
                     .controlSize(.small)
+            }
+        }
+    }
+
+    private var sidebarVisible: Bool { showChapters && !reader.chapters.isEmpty && !reader.paragraphs.isEmpty }
+
+    /// The chapter containing the paragraph being read.
+    private var currentChapter: Int? {
+        guard let i = reader.currentIndex else { return nil }
+        return reader.chapters.last { ($0.paragraph ?? .max) <= i }?.id
+    }
+
+    private var chapterList: some View {
+        ScrollViewReader { proxy in
+            List(reader.chapters) { chapter in
+                let current = chapter.id == currentChapter
+                Button {
+                    if let p = chapter.paragraph { reader.speak(p) }
+                } label: {
+                    Text(chapter.title)
+                        .lineLimit(2)
+                        .fontWeight(current ? .semibold : .regular)
+                        .foregroundStyle(chapter.paragraph == nil ? Color.secondary.opacity(0.6)
+                                         : current ? Color.accentColor : Color.primary)
+                        .padding(.leading, CGFloat(min(chapter.level, 4)) * 12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(chapter.paragraph == nil)
+                .help(chapter.paragraph == nil ? "Not part of the text being read" : chapter.title)
+                .id(chapter.id)
+            }
+            .listStyle(.sidebar)
+            .frame(width: 180)
+            .onChange(of: currentChapter) { _, id in
+                if let id { withAnimation { proxy.scrollTo(id) } }
             }
         }
     }
@@ -1399,6 +1506,11 @@ enum Main {
         let paragraphs = Extractor.paragraphs(pages: lines, rects: rects, options: options, skipped: &skipped)
         print("=== SKIPPED ===")
         for s in skipped { print("p\(s.pageIndex + 1) [\(s.reason)] \(s.text)") }
+        print("\n=== CHAPTERS ===")
+        for c in Outline.chapters(Outline.entries(of: doc), in: paragraphs) {
+            let target = c.paragraph.map { "p\(paragraphs[$0].pageIndex + 1): \(paragraphs[$0].text.prefix(60))" } ?? "(not read)"
+            print("\(String(repeating: "  ", count: c.level))\(c.title) → \(target)")
+        }
         print("\n=== READ ALOUD ===")
         for p in paragraphs {
             print("p\(p.pageIndex + 1)\(p.kind == .heading ? " [HEADING]" : ""): \(p.text)\n")
