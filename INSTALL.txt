@@ -19,6 +19,7 @@ Using it
 • Drop a PDF on the window (or ⌘O). Click any word in the text to start reading there.
 • If the PDF has chapters (bookmarks), they appear in a sidebar: click one to jump there.
   The sidebar button next to ⋯ shows or hides it.
+• Next to the progress bar: how long the document takes to read, then the time left.
 • Space / keyboard play-pause key / AirPods: play & pause. ⌘← ⌘→ or ⏪ ⏩: previous/next paragraph.
 • ⋯ menu → Voice: "System Voice" uses the voice chosen in
   System Settings → Accessibility → Spoken Content (including Siri voices).
